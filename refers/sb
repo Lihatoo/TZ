@@ -1,0 +1,684 @@
+#!/usr/bin/env bash
+set -euo pipefail
+shopt -s nullglob
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
+SB_ROOT="${SING_BOX_ROOT:-$SCRIPT_DIR}"
+SB_BIN="${SING_BOX_BIN:-${SB_ROOT}/sing-box/sing-box}"
+SB_SYSTEM="${SB_ROOT}/system/config.json"
+SB_BYPASS="${SB_ROOT}/bypass.list"
+SB_PROFILES="${SB_ROOT}/profiles"
+SB_CURRENT="${SB_ROOT}/current.profile"
+SB_SETTINGS="${SB_ROOT}/settings.json"
+SB_RUN_DIR="${SING_BOX_RUN_DIR:-${SB_ROOT}/.runtime}"
+SB_CONFIG="${SB_RUN_DIR}/config.json"
+SB_RULES="${SB_RUN_DIR}/bypass-rules.json"
+SB_PID_FILE="${SB_RUN_DIR}/run.pid"
+SB_LOG="${SB_RUN_DIR}/sing-box.log"
+SB_PORT="${SING_BOX_PORT:-7890}"
+SB_API_PORT="${SING_BOX_API_PORT:-9090}"
+SB_API="http://127.0.0.1:${SB_API_PORT}"
+
+die() { printf 'sb: %s\n' "$*" >&2; exit 1; }
+info() { printf 'sb: %s\n' "$*"; }
+warn() { printf 'sb: warning: %s\n' "$*" >&2; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing command: $1"; }
+
+init_layout() {
+  [[ -x "$SB_BIN" ]] || die "sing-box binary is not executable: $SB_BIN"
+  [[ -f "$SB_SYSTEM" ]] || die "system config not found: $SB_SYSTEM"
+  [[ -f "$SB_BYPASS" ]] || die "bypass list not found: $SB_BYPASS"
+  need jq
+  mkdir -p "$SB_PROFILES" "$SB_RUN_DIR"
+  if [[ ! -f "$SB_SETTINGS" ]]; then
+    printf '%s\n' '{"mode":"rule","tun":false,"cliproxy":false,"sysproxy":false}' >"$SB_SETTINGS"
+  fi
+}
+
+setting() { jq -r --arg key "$1" '.[$key]' "$SB_SETTINGS"; }
+
+set_setting() {
+  local key="$1" value="$2"
+  if [[ "$value" == true || "$value" == false ]]; then
+    jq --arg key "$key" --argjson value "$value" '.[$key] = $value' "$SB_SETTINGS" >"${SB_SETTINGS}.tmp"
+  else
+    jq --arg key "$key" --arg value "$value" '.[$key] = $value' "$SB_SETTINGS" >"${SB_SETTINGS}.tmp"
+  fi
+  mv -f "${SB_SETTINGS}.tmp" "$SB_SETTINGS"
+}
+
+profile_dir() { printf '%s/%s\n' "$SB_PROFILES" "$1"; }
+provider_file() { printf '%s/provider.json\n' "$(profile_dir "$1")"; }
+metadata_file() { printf '%s/source.json\n' "$(profile_dir "$1")"; }
+validate_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die 'profile name contains unsupported characters'; }
+
+current_profile() {
+  [[ -f "$SB_CURRENT" ]] || return 1
+  local name
+  name="$(tr -d '[:space:]' <"$SB_CURRENT")"
+  [[ -n "$name" && -f "$(provider_file "$name")" ]] || return 1
+  printf '%s\n' "$name"
+}
+
+list_profiles() {
+  local file
+  for file in "$SB_PROFILES"/*/provider.json; do
+    [[ -f "$file" ]] && basename "$(dirname "$file")"
+  done | sort
+}
+
+validate_provider() {
+  jq -e 'type == "object" and (.outbounds | type == "array") and (.outbounds | length > 0)' "$1" >/dev/null \
+    || die "provider must be sing-box JSON with non-empty .outbounds: $1"
+}
+
+fetch_provider() {
+  local src="$1" dest="$2"
+  if [[ "$src" =~ ^https?:// ]]; then
+    need curl
+    curl -fL --connect-timeout 15 --max-time 90 -A 'sb/1.0 sing-box-provider' "$src" -o "$dest"
+  elif [[ -f "$src" ]]; then
+    cp -f -- "$src" "$dest"
+  else
+    die "source is neither an HTTP URL nor a file: $src"
+  fi
+  validate_provider "$dest"
+}
+
+add_cmd() {
+  local name="${1:-}" src="${2:-}" dir tmp kind saved_src
+  [[ -n "$name" && -n "$src" ]] || die 'usage: sb add <name> <url|file>'
+  validate_name "$name"
+  dir="$(profile_dir "$name")"
+  [[ ! -e "$dir" ]] || die "profile already exists: $name"
+  mkdir -p "$dir"
+  tmp="${dir}/provider.json.tmp"
+  if [[ "$src" =~ ^https?:// ]]; then kind=http; saved_src="$src"; else kind=file; saved_src="$(readlink -f "$src")"; fi
+  if ! fetch_provider "$src" "$tmp"; then rm -f "$tmp"; rmdir "$dir" 2>/dev/null || true; return 1; fi
+  mv -f "$tmp" "${dir}/provider.json"
+  jq -n --arg name "$name" --arg type "$kind" --arg source "$saved_src" --arg added_at "$(date -Iseconds)" \
+    '{name:$name,type:$type,source:$source,added_at:$added_at}' >"${dir}/source.json"
+  printf '%s\n' "$name" >"$SB_CURRENT"
+  info "added profile=${name} type=${kind}"
+  info "run: sb start ${name}"
+}
+
+compile_bypass_rules() {
+  local line value prefix
+  : >"${SB_RULES}.ndjson"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="$(sed -E 's/^[[:space:]]+|[[:space:]]+$//g' <<<"$line")"
+    [[ -n "$line" ]] || continue
+    if [[ "$line" == */* ]]; then
+      jq -nc --arg v "$line" '{ip_cidr:[$v],action:"route",outbound:"DIRECT"}' >>"${SB_RULES}.ndjson"
+    elif [[ "$line" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      jq -nc --arg v "${line}/32" '{ip_cidr:[$v],action:"route",outbound:"DIRECT"}' >>"${SB_RULES}.ndjson"
+    elif [[ "$line" =~ ^(10|127|172|192)(\..*)?\*$ ]]; then
+      prefix="${BASH_REMATCH[1]}"
+      case "$prefix" in 10) value='10.0.0.0/8';; 127) value='127.0.0.0/8';; 172) value='172.16.0.0/12';; 192) value='192.168.0.0/16';; esac
+      jq -nc --arg v "$value" '{ip_cidr:[$v],action:"route",outbound:"DIRECT"}' >>"${SB_RULES}.ndjson"
+    elif [[ "$line" == \** || "$line" == .* ]]; then
+      value="${line#\*}"; value="${value#.}"
+      [[ -n "$value" ]] && jq -nc --arg v "$value" '{domain_suffix:[$v],action:"route",outbound:"DIRECT"}' >>"${SB_RULES}.ndjson"
+    else
+      jq -nc --arg v "$line" '{domain:[$v],action:"route",outbound:"DIRECT"}' >>"${SB_RULES}.ndjson"
+    fi
+  done <"$SB_BYPASS"
+  jq -s 'unique' "${SB_RULES}.ndjson" >"${SB_RULES}.tmp"
+  mv -f "${SB_RULES}.tmp" "$SB_RULES"
+  rm -f "${SB_RULES}.ndjson"
+}
+
+proxy_bypass_items() {
+  local mode="$1" line value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="$(sed -E 's/^[[:space:]]+|[[:space:]]+$//g' <<<"$line")"
+    [[ -n "$line" ]] || continue
+    value="$line"
+    if [[ "$mode" == no_proxy && "$value" == \*.* ]]; then
+      value=".${value#*.}"
+    elif [[ "$mode" == gsettings && "$value" == .* ]]; then
+      value="*${value}"
+    fi
+    printf '%s\n' "$value"
+  done <"$SB_BYPASS" | awk '!seen[$0]++'
+}
+
+no_proxy_value() { proxy_bypass_items no_proxy | paste -sd, -; }
+gsettings_bypass_value() { proxy_bypass_items gsettings | jq -Rsc 'split("\n") | map(select(length > 0))'; }
+
+build_config() {
+  local profile="$1" provider mode tun
+  provider="$(provider_file "$profile")"
+  [[ -f "$provider" ]] || die "profile not found: $profile"
+  validate_provider "$provider"
+  compile_bypass_rules
+  mode="$(setting mode)"; tun="$(setting tun)"
+  jq -n --slurpfile provider "$provider" --slurpfile system "$SB_SYSTEM" --slurpfile bypass "$SB_RULES" \
+    --arg mode "$mode" --argjson tun "$tun" --argjson port "$SB_PORT" --arg controller "127.0.0.1:${SB_API_PORT}" '
+      ($provider[0]) as $p | ($system[0]) as $s | ($bypass[0]) as $b
+      | ($p.outbounds // []) as $original
+      | ($original | map(.tag // empty)) as $tags0
+      | ($original + if ($tags0|index("DIRECT")) == null then [{type:"direct",tag:"DIRECT"}] else [] end) as $direct_added
+      | ($direct_added | map(.tag // empty)) as $tags1
+      | ($direct_added + if ($tags1|index("Proxy")) == null then
+          [{type:"selector",tag:"Proxy",outbounds:[$direct_added[]|select(.type!="direct" and .type!="block" and .type!="dns" and .type!="selector")|.tag]}]
+        else [] end) as $outbounds
+      | ($outbounds | map(.tag // empty)) as $outbound_tags
+      | ([{type:"mixed",tag:"mixed-in",listen:"127.0.0.1",listen_port:$port,set_system_proxy:false}]
+         + if $tun then [($p.inbounds // [] | map(select(.type=="tun")) | .[0]
+             // {type:"tun",tag:"tun-in",address:["172.19.0.1/30","fdfe:dcba:9876::1/126"],auto_route:true,strict_route:true})] else [] end) as $inbounds
+      | ([{action:"sniff"}] + if $tun then [{protocol:"dns",action:"hijack-dns"}] else [] end + $b) as $system_rules
+      | (($p.route.rules // []) | map(select(.action!="sniff" and .action!="hijack-dns"))) as $provider_rules
+      | (if $mode=="rule" then $system_rules+$provider_rules else $system_rules end) as $rules
+      | (if $mode=="direct" then "DIRECT" elif $mode=="global" then "Proxy"
+         elif (($p.route.final // "") as $f | ($outbound_tags|index($f)) != null) then $p.route.final else "Proxy" end) as $final
+      | $p
+      | .log=$s.log | .dns=$s.dns | .inbounds=$inbounds | .outbounds=$outbounds
+      | .route=(($p.route // {}) * ($s.route // {}))
+      | .route.auto_detect_interface=$tun | .route.rules=$rules | .route.final=$final
+      | .experimental=(($p.experimental // {}) * ($s.experimental // {}))
+      | .experimental.clash_api.external_controller=$controller
+    ' >"${SB_CONFIG}.tmp"
+  mv -f "${SB_CONFIG}.tmp" "$SB_CONFIG"
+}
+
+process_alive() {
+  local pid="$1" state _
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || return 1
+  read -r _ _ state _ <"/proc/${pid}/stat" 2>/dev/null || return 1
+  [[ "$state" != Z ]]
+}
+
+is_running() {
+  [[ -f "$SB_PID_FILE" ]] || return 1
+  process_alive "$(<"$SB_PID_FILE")"
+}
+
+port_in_use() {
+  ss -ltnH 2>/dev/null | awk -v suffix=":$1" 'substr($4,length($4)-length(suffix)+1)==suffix{f=1} END{exit !f}'
+}
+
+api_curl() {
+  local secret="$(jq -r '.experimental.clash_api.secret // empty' "$SB_CONFIG" 2>/dev/null || true)"
+  if [[ -n "$secret" ]]; then curl -fsS --noproxy '*' -H "Authorization: Bearer ${secret}" "$@"; else curl -fsS --noproxy '*' "$@"; fi
+}
+
+wait_api() { local i; for i in {1..50}; do api_curl "${SB_API}/proxies" >/dev/null 2>&1 && return 0; sleep 0.1; done; return 1; }
+
+stop_cmd() {
+  if ! is_running; then rm -f "$SB_PID_FILE"; info 'not running'; return 0; fi
+  local pid="$(<"$SB_PID_FILE")" expected actual comm cmdline i
+  expected="$(readlink -f "$SB_BIN")"
+  actual="$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)"
+  comm="$(cat "/proc/${pid}/comm" 2>/dev/null || true)"
+  cmdline="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null || true)"
+  if [[ -z "$actual" ]] && ! process_alive "$pid"; then
+    rm -f "$SB_PID_FILE"; info 'process already exited'; return 0
+  fi
+  if [[ "$actual" != "$expected" ]]; then
+    [[ "$comm" == "$(basename "$SB_BIN")" && "$cmdline" == "$SB_BIN run "* && "$cmdline" == *" -c $SB_CONFIG"* ]] \
+      || die "refusing to stop pid ${pid}: process identity does not match sb runtime"
+  fi
+  kill "$pid" 2>/dev/null || true
+  for i in {1..30}; do process_alive "$pid" || break; sleep 0.1; done
+  process_alive "$pid" && die "pid ${pid} did not stop"
+  rm -f "$SB_PID_FILE"; info "stopped pid ${pid}"
+}
+
+choose_profile() {
+  local requested="${1:-}" current pick i
+  local -a profiles
+  mapfile -t profiles < <(list_profiles)
+  (( ${#profiles[@]} )) || die 'no providers; use: sb add <name> <url|file>'
+  current="$(current_profile 2>/dev/null || true)"
+  if [[ -n "$requested" ]]; then [[ -f "$(provider_file "$requested")" ]] || die "profile not found: $requested"; echo "$requested"; return; fi
+  if [[ ! -t 0 ]]; then [[ -n "$current" ]] || die 'non-interactive start requires profile name'; echo "$current"; return; fi
+  echo 'Available providers:' >&2
+  for i in "${!profiles[@]}"; do
+    [[ "${profiles[$i]}" == "$current" ]] && printf '  %d) %s (current)\n' "$((i+1))" "${profiles[$i]}" >&2 || printf '  %d) %s\n' "$((i+1))" "${profiles[$i]}" >&2
+  done
+  while true; do
+    read -r -p "Choose provider (1-${#profiles[@]}, 0 cancel): " pick
+    [[ "$pick" =~ ^[0-9]+$ ]] || { echo 'Please enter a number.' >&2; continue; }
+    (( pick==0 )) && return 1
+    (( pick>=1 && pick<=${#profiles[@]} )) || { echo 'Out of range.' >&2; continue; }
+    echo "${profiles[$((pick-1))]}"; return
+  done
+}
+
+start_cmd() {
+  local profile pid i
+  profile="$(choose_profile "${1:-}")" || { info 'cancelled'; return; }
+  is_running && stop_cmd
+  build_config "$profile"
+  "$SB_BIN" check -D "$SB_RUN_DIR" -c "$SB_CONFIG"
+  need ss
+  port_in_use "$SB_PORT" && die "port ${SB_PORT} is in use (stop mihomo before sb)"
+  port_in_use "$SB_API_PORT" && die "API port ${SB_API_PORT} is in use (stop mihomo before sb)"
+  : >"$SB_LOG"
+  nohup "$SB_BIN" run -D "$SB_RUN_DIR" -c "$SB_CONFIG" >>"$SB_LOG" 2>&1 & pid=$!
+  echo "$pid" >"$SB_PID_FILE"; echo "$profile" >"$SB_CURRENT"
+  for i in {1..40}; do
+    if ! kill -0 "$pid" 2>/dev/null; then rm -f "$SB_PID_FILE"; tail -n 50 "$SB_LOG" >&2 || true; die 'sing-box exited during startup'; fi
+    if port_in_use "$SB_PORT" && port_in_use "$SB_API_PORT"; then
+      info "started profile=${profile} pid=${pid} mode=$(setting mode) tun=$(setting tun)"; wait_api || warn 'API not ready'; return
+    fi
+    sleep 0.1
+  done
+  tail -n 50 "$SB_LOG" >&2 || true; die 'startup timed out'
+}
+
+restart_if_running() {
+  local profile="$(current_profile 2>/dev/null || true)"
+  if is_running; then stop_cmd; start_cmd "$profile"; fi
+}
+
+require_api() { is_running || die 'sing-box is not running'; api_curl "${SB_API}/proxies" >/dev/null || die "API unavailable: $SB_API"; }
+urlencode() { jq -nr --arg v "$1" '$v|@uri'; }
+
+api_delay() {
+  local node="$1" timeout="${2:-1800}" encoded url
+  encoded="$(urlencode "$node")"; url="$(urlencode 'https://www.gstatic.com/generate_204')"
+  api_curl "${SB_API}/proxies/${encoded}/delay?timeout=${timeout}&url=${url}" 2>/dev/null \
+    | jq -r 'if (.delay|type)=="number" then .delay else 999999 end' 2>/dev/null || echo 999999
+}
+
+delay_text() {
+  local delay="${1:-}"
+  [[ "$delay" =~ ^[0-9]+$ && "$delay" != 999999 ]] && printf '%sms\n' "$delay" || printf 'timeout\n'
+}
+
+main_group() { jq -r 'if .proxies.Proxy.all then "Proxy" else [.proxies|to_entries[]|select(.value.all!=null)][0].key//empty end' <<<"$1"; }
+
+display_node_grid() {
+  local -n ref=$1
+  local count=${#ref[@]} width cols=1 rows r c idx
+  width="$(tput cols 2>/dev/null || echo 120)"
+  (( count>18 && width>=110 )) && cols=2
+  (( count>36 && width>=170 )) && cols=3
+  rows=$(((count+cols-1)/cols))
+  for ((r=0;r<rows;r++)); do
+    for ((c=0;c<cols;c++)); do
+      idx=$((r+c*rows)); ((idx<count)) || continue
+      if ((c+1<cols && idx+rows<count)); then printf '%-56s' "${ref[$idx]}"; else printf '%s' "${ref[$idx]}"; fi
+    done
+    echo
+  done
+}
+
+list_nodes_cmd() {
+  local keyword="${1:-}" json group now candidates tmp running=0 i d pick encoded body
+  local -a nodes sorted_nodes=() sorted_delays=() display=()
+  require_api; json="$(api_curl "${SB_API}/proxies")"; group="$(main_group "$json")"; [[ -n "$group" ]] || die 'no selectable group'
+  now="$(jq -r --arg g "$group" '.proxies[$g].now//empty' <<<"$json")"
+  candidates="$(jq -r --arg g "$group" --arg kw "$keyword" '
+    def lc: ascii_downcase; . as $r | .proxies[$g].all[] as $n | ($r.proxies[$n].type//"") as $t
+    | select(["Direct","Reject","Block","Selector","URLTest","Fallback","LoadBalance"]|index($t)==null)
+    | select($kw=="" or ($n|contains($kw)) or (($n|lc)|contains($kw|lc))) | $n' <<<"$json")"
+  [[ -n "$candidates" ]] || die "no nodes matched: ${keyword:-<all>}"; mapfile -t nodes <<<"$candidates"
+  tmp="$(mktemp -d "${SB_RUN_DIR}/delay.XXXXXX")"; info "testing ${#nodes[@]} nodes (1800ms, 8 jobs)..."
+  for i in "${!nodes[@]}"; do
+    (api_delay "${nodes[$i]}" >"${tmp}/${i}") & running=$((running+1))
+    if ((running>=8)); then wait -n 2>/dev/null || wait; running=$((running-1)); fi
+  done
+  wait; : >"${tmp}/index"
+  for i in "${!nodes[@]}"; do d="$(<"${tmp}/${i}")"; [[ "$d" =~ ^[0-9]+$ ]] || d=999999; printf '%s\t%s\n' "$d" "$i" >>"${tmp}/index"; done
+  while IFS=$'\t' read -r d i; do sorted_delays+=("$d"); sorted_nodes+=("${nodes[$i]}"); done < <(sort -n "${tmp}/index")
+  rm -rf -- "$tmp"
+  printf 'Group: %s  Current: %s' "$group" "$now"; [[ -n "$keyword" ]] && printf '  Filter: %s' "$keyword"; echo
+  for i in "${!sorted_nodes[@]}"; do
+    d="$(delay_text "${sorted_delays[$i]}")"
+    [[ "${sorted_nodes[$i]}" == "$now" ]] && display+=("[$((i+1))] * ${sorted_nodes[$i]}  ${d}") || display+=("[$((i+1))]   ${sorted_nodes[$i]}  ${d}")
+  done
+  display_node_grid display
+  [[ -t 0 ]] || return
+  while true; do
+    read -r -p "Choose node (1-${#sorted_nodes[@]}, 0 cancel): " pick
+    [[ "$pick" =~ ^[0-9]+$ ]] || { echo 'Please enter a number.'; continue; }
+    ((pick==0)) && { info cancelled; return; }
+    ((pick>=1 && pick<=${#sorted_nodes[@]})) || { echo 'Out of range.'; continue; }; break
+  done
+  encoded="$(urlencode "$group")"; body="$(jq -nc --arg name "${sorted_nodes[$((pick-1))]}" '{name:$name}')"
+  api_curl -X PUT -H 'Content-Type: application/json' --data "$body" "${SB_API}/proxies/${encoded}" >/dev/null
+  info "${group} -> ${sorted_nodes[$((pick-1))]} (${sorted_delays[$((pick-1))]}ms)"
+}
+
+show_env() {
+  local no_proxy
+  no_proxy="$(no_proxy_value)"
+  cat <<EOF
+export http_proxy="http://127.0.0.1:${SB_PORT}"
+export https_proxy="http://127.0.0.1:${SB_PORT}"
+export all_proxy="socks5h://127.0.0.1:${SB_PORT}"
+export HTTP_PROXY="\$http_proxy"
+export HTTPS_PROXY="\$https_proxy"
+export ALL_PROXY="\$all_proxy"
+EOF
+  printf 'export NO_PROXY=%q\n' "$no_proxy"
+  printf '%s\n' 'export no_proxy="$NO_PROXY"'
+}
+show_noenv() { echo 'unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY no_proxy'; }
+
+shell_init_cmd() {
+  local real="$(printf '%q' "$SCRIPT_PATH")"
+  cat <<EOF
+sb() {
+  SB_SHELL_HOOK=1 ${real} "\$@"
+  local rc=\$?
+  if ((rc==0)) && [[ "\${1:-}" == set ]] && { [[ "\${2:-}" == cliproxy ]] || [[ "\${2:-}" == proxy ]]; }; then
+    if [[ "\${3:-}" == on ]]; then eval "\$(${real} env)"; else eval "\$(${real} noenv)"; fi
+  fi
+  return \$rc
+}
+EOF
+  [[ "$(setting cliproxy)" == true ]] && show_env || show_noenv
+}
+
+sysproxy_cmd() {
+  local action="$1" ignore_hosts; need gsettings
+  case "$action" in
+    on)
+      ignore_hosts="$(gsettings_bypass_value)"
+      gsettings set org.gnome.system.proxy mode manual
+      gsettings set org.gnome.system.proxy.http host 127.0.0.1; gsettings set org.gnome.system.proxy.http port "$SB_PORT"
+      gsettings set org.gnome.system.proxy.https host 127.0.0.1; gsettings set org.gnome.system.proxy.https port "$SB_PORT"
+      gsettings set org.gnome.system.proxy.socks host 127.0.0.1; gsettings set org.gnome.system.proxy.socks port "$SB_PORT"
+      gsettings set org.gnome.system.proxy ignore-hosts "$ignore_hosts"
+      set_setting sysproxy true; info "system proxy ON -> 127.0.0.1:${SB_PORT}" ;;
+    off) gsettings set org.gnome.system.proxy mode none; set_setting sysproxy false; info 'system proxy OFF' ;;
+    status) printf 'sysproxy setting=%s gnome-mode=%s\n' "$(setting sysproxy)" "$(gsettings get org.gnome.system.proxy mode)" ;;
+    *) die 'usage: sb set sysproxy on|off' ;;
+  esac
+}
+
+default_bypass() {
+  cat <<'EOF'
+# sb system bypass rules (one item per line)
+localhost
+*.local
+127.0.0.0/8
+10.0.0.0/8
+172.16.0.0/12
+192.168.0.0/16
+100.64.0.2
+100.64.0.0/10
+::1/128
+fc00::/7
+fe80::/10
+EOF
+}
+
+rules_cmd() {
+  case "${1:-show}" in
+    show) echo "bypass.list: $SB_BYPASS"; nl -ba "$SB_BYPASS" ;;
+    update) compile_bypass_rules; [[ "$(setting sysproxy)" == true ]] && sysproxy_cmd on; info "compiled $(jq length "$SB_RULES") bypass rules"; restart_if_running ;;
+    reset) default_bypass >"${SB_BYPASS}.tmp"; mv -f "${SB_BYPASS}.tmp" "$SB_BYPASS"; compile_bypass_rules; [[ "$(setting sysproxy)" == true ]] && sysproxy_cmd on; info 'bypass.list reset'; restart_if_running ;;
+    *) die 'usage: sb set rules show|update|reset' ;;
+  esac
+}
+
+set_cmd() {
+  local target="${1:-}" action="${2:-}"
+  [[ -n "$target" ]] || { jq . "$SB_SETTINGS"; sysproxy_cmd status 2>/dev/null || true; return; }
+  case "$target" in
+    cliproxy)
+      [[ "$action" == on || "$action" == off ]] || die 'usage: sb set cliproxy on|off'
+      set_setting cliproxy "$([[ "$action" == on ]] && echo true || echo false)"; info "CLI proxy ${action}"
+      [[ -n "${SB_SHELL_HOOK:-}" ]] || warn 'current shell needs one-time: eval "$(sb shell-init)"' ;;
+    sysproxy) sysproxy_cmd "$action" ;;
+    proxy)
+      [[ "$action" == on || "$action" == off ]] || die 'usage: sb set proxy on|off'
+      set_setting cliproxy "$([[ "$action" == on ]] && echo true || echo false)"; sysproxy_cmd "$action"; info "CLI + system proxy ${action}"
+      [[ -n "${SB_SHELL_HOOK:-}" ]] || warn 'current shell needs one-time: eval "$(sb shell-init)"' ;;
+    tun)
+      [[ "$action" == on || "$action" == off ]] || die 'usage: sb set tun on|off'
+      set_setting tun "$([[ "$action" == on ]] && echo true || echo false)"
+      if [[ "$action" == on ]] && ! getcap "$SB_BIN" 2>/dev/null | grep -q cap_net_admin; then warn "TUN may need: sudo setcap cap_net_admin,cap_net_raw+ep '$SB_BIN'"; fi
+      info "TUN ${action}"; restart_if_running ;;
+    rules) rules_cmd "$action" ;;
+    *) die 'usage: sb set cliproxy|sysproxy|proxy|tun|rules ...' ;;
+  esac
+}
+
+update_cmd() {
+  local profile meta source type dir tmp running=false
+  profile="$(current_profile 2>/dev/null || true)"; [[ -n "$profile" ]] || die 'no current profile'
+  meta="$(metadata_file "$profile")"; [[ -f "$meta" ]] || die "missing metadata: $meta"
+  type="$(jq -r .type "$meta")"; source="$(jq -r .source "$meta")"; [[ "$type" == http ]] || die 'current provider is a local file, not HTTP'
+  is_running && running=true; dir="$(profile_dir "$profile")"; tmp="${dir}/provider.json.tmp"
+  fetch_provider "$source" "$tmp"; mv -f "$tmp" "${dir}/provider.json"
+  jq --arg t "$(date -Iseconds)" '.updated_at=$t' "$meta" >"${meta}.tmp"; mv -f "${meta}.tmp" "$meta"
+  info "updated HTTP provider: $profile"; [[ "$running" == true ]] && { stop_cmd; start_cmd "$profile"; }
+}
+
+mode_cmd() {
+  local mode="${1:-}"; [[ "$mode" == rule || "$mode" == global || "$mode" == direct ]] || die 'usage: sb mode rule|global|direct'
+  set_setting mode "$mode"; info "mode -> $mode"; restart_if_running
+}
+
+status_cmd() {
+  local profile="$(current_profile 2>/dev/null || true)" now='' delay=''
+  if is_running; then
+    now="$(api_curl "${SB_API}/proxies/Proxy" 2>/dev/null | jq -r '.now//empty' || true)"
+    [[ -n "$now" ]] && delay="$(delay_text "$(api_delay "$now")")"
+    printf 'sing-box: RUNNING pid=%s\n' "$(<"$SB_PID_FILE")"
+  else
+    echo 'sing-box: STOPPED'
+  fi
+  printf 'root:     %s\nprofile:  %s\nmode:     %s\ntun:      %s\ncliproxy: %s\nsysproxy: %s\nmixed:    127.0.0.1:%s\napi:      127.0.0.1:%s\n' \
+    "$SB_ROOT" "${profile:-<none>}" "$(setting mode)" "$(setting tun)" "$(setting cliproxy)" "$(setting sysproxy)" "$SB_PORT" "$SB_API_PORT"
+  [[ -n "$now" ]] && printf 'node:     %s  %s\n' "$now" "$delay"
+}
+
+check_cmd() {
+  local profile="${1:-}"; [[ -n "$profile" ]] || profile="$(current_profile 2>/dev/null || true)"; [[ -n "$profile" ]] || die 'no profile to check'
+  build_config "$profile"; "$SB_BIN" check -D "$SB_RUN_DIR" -c "$SB_CONFIG"; info "configuration OK: profile=$profile"
+}
+
+db_ports() {
+  echo "== listening proxy ports =="
+  ss -ltnp 2>/dev/null | awk -v p1=":${SB_PORT}" -v p2=":${SB_API_PORT}" 'NR==1 || index($4,p1) || index($4,p2)'
+  if ! port_in_use "$SB_PORT" && ! port_in_use "$SB_API_PORT"; then echo 'no sb ports listening'; fi
+}
+
+db_process() {
+  local pid="${1:-}"
+  [[ -n "$pid" ]] || { [[ -f "$SB_PID_FILE" ]] && pid="$(<"$SB_PID_FILE")" || true; }
+  [[ "$pid" =~ ^[0-9]+$ ]] || { echo 'no managed PID'; return 1; }
+  ps -p "$pid" -o pid,ppid,user,state,etime,%cpu,%mem,cmd
+  echo
+  printf 'comm: '; cat "/proc/${pid}/comm" 2>/dev/null || echo '<unavailable>'
+  printf 'cmdline: '; tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null || true; echo
+}
+
+db_probe_one() {
+  local mode="$1" url="$2"
+  case "$mode" in
+    direct) curl -fsSIL --max-time 10 --noproxy '*' "$url" -o /dev/null ;;
+    proxy) curl -fsSIL --max-time 10 --proxy "http://127.0.0.1:${SB_PORT}" "$url" -o /dev/null ;;
+  esac
+}
+
+db_net() {
+  local mode="${1:-proxy}" url direct_result proxy_result
+  local -a urls=(
+    'https://www.google.com'
+    'https://www.cloudflare.com'
+    'https://www.github.com'
+    'https://www.youtube.com'
+    'https://www.baidu.com'
+    'https://www.bing.com'
+  )
+  case "$mode" in
+    proxy)
+      is_running || die 'sing-box is not running; proxy test unavailable'
+      echo "== proxy network test (127.0.0.1:${SB_PORT}) =="
+      for url in "${urls[@]}"; do db_probe_one proxy "$url" && proxy_result=OK || proxy_result=FAIL; printf '%-32s PROXY:%s\n' "$url" "$proxy_result"; done
+      ;;
+    direct)
+      echo '== direct network test =='
+      for url in "${urls[@]}"; do db_probe_one direct "$url" && direct_result=OK || direct_result=FAIL; printf '%-32s DIRECT:%s\n' "$url" "$direct_result"; done
+      ;;
+    compare)
+      is_running || die 'sing-box is not running; comparison needs the mixed proxy'
+      echo '== DIRECT vs PROXY =='
+      for url in "${urls[@]}"; do
+        db_probe_one direct "$url" && direct_result=OK || direct_result=FAIL
+        db_probe_one proxy "$url" && proxy_result=OK || proxy_result=FAIL
+        printf '%-32s DIRECT:%-4s PROXY:%-4s\n' "$url" "$direct_result" "$proxy_result"
+      done
+      ;;
+    *) die 'usage: sb db net [proxy|direct] | sb db compare' ;;
+  esac
+}
+
+db_deps() {
+  local item path rc=0
+  local -a required=(jq curl ss sed sort readlink)
+  local -a optional=(gsettings getcap ip resolvectl tput)
+  echo '== required commands =='
+  for item in "${required[@]}"; do path="$(command -v "$item" 2>/dev/null || true)"; [[ -n "$path" ]] && printf 'OK      %-12s %s\n' "$item" "$path" || { printf 'MISSING %s\n' "$item"; rc=1; }; done
+  echo '== optional commands =='
+  for item in "${optional[@]}"; do path="$(command -v "$item" 2>/dev/null || true)"; [[ -n "$path" ]] && printf 'OK      %-12s %s\n' "$item" "$path" || printf 'MISSING %s\n' "$item"; done
+  [[ -x "$SB_BIN" ]] && echo "OK      sing-box     $SB_BIN" || { echo "MISSING sing-box     $SB_BIN"; rc=1; }
+  jq -e . "$SB_SYSTEM" "$SB_SETTINGS" >/dev/null && echo 'OK      system/settings JSON' || rc=1
+  return "$rc"
+}
+
+db_interfaces() {
+  echo '== interfaces =='
+  if command -v ip >/dev/null 2>&1; then ip -brief link show; else echo 'ip command not found'; fi
+  echo
+  echo '== TUN expectation =='
+  printf 'setting: %s\n' "$(setting tun)"
+  if command -v ip >/dev/null 2>&1; then ip -brief link show | awk '$1 ~ /^(tun|sing|utun)/ {print}' || true; fi
+}
+
+db_dns() {
+  echo '== sb DNS configuration =='
+  jq .dns "$SB_SYSTEM"
+  echo
+  echo '== host resolver =='
+  if command -v resolvectl >/dev/null 2>&1; then resolvectl status 2>/dev/null | sed -n '1,140p'; else cat /etc/resolv.conf; fi
+}
+
+db_routes() {
+  if ! command -v ip >/dev/null 2>&1; then echo 'ip command not found'; return 1; fi
+  echo '== routes =='; ip route show
+  echo; echo '== policy rules =='; ip rule show
+  echo; echo '== IPv6 routes =='; ip -6 route show 2>/dev/null || true
+}
+
+db_api() {
+  local json
+  require_api
+  echo "== Clash API ${SB_API} =="
+  api_curl "${SB_API}/version" | jq .
+  json="$(api_curl "${SB_API}/proxies")"
+  echo; echo '== selector groups =='
+  jq -r '.proxies | to_entries[] | select(.value.all != null) | "\(.key) -> \(.value.now // "-")  (\(.value.all|length) choices)"' <<<"$json"
+}
+
+db_config() {
+  local profile
+  profile="$(current_profile 2>/dev/null || true)"
+  [[ -n "$profile" ]] || die 'no current profile'
+  check_cmd "$profile"
+  jq '{log,inbounds,outbounds:(.outbounds|map({type,tag})),dns,route:{final:.route.final,rule_count:(.route.rules|length),rule_set_count:(.route.rule_set//[]|length)},experimental}' "$SB_CONFIG"
+}
+
+db_log() {
+  local lines="${1:-80}"
+  [[ "$lines" =~ ^[0-9]+$ ]] || die 'usage: sb db log [lines]'
+  [[ -f "$SB_LOG" ]] && tail -n "$lines" "$SB_LOG" || echo 'no log file'
+}
+
+db_menu() {
+  local pick i
+  local -a commands=(ports process net compare deps interfaces dns routes api config log)
+  local -a descriptions=(
+    'proxy/API port listeners'
+    'managed process details'
+    'proxy-only network test'
+    'direct versus proxy network test'
+    'required and optional dependencies'
+    'network interfaces and TUN expectation'
+    'sing-box DNS and host resolver'
+    'routes and policy routing'
+    'Clash API and selector groups'
+    'merged configuration summary and check'
+    'recent sing-box log'
+  )
+  echo '== sb db =='
+  for i in "${!commands[@]}"; do printf '  %2d) %-12s %s\n' "$((i+1))" "${commands[$i]}" "${descriptions[$i]}"; done
+  [[ -t 0 ]] || return 0
+  while true; do
+    read -r -p "Choose debug action (1-${#commands[@]}, 0 cancel): " pick
+    [[ "$pick" =~ ^[0-9]+$ ]] || { echo 'Please enter a number.'; continue; }
+    (( pick==0 )) && { info cancelled; return 0; }
+    (( pick>=1 && pick<=${#commands[@]} )) || { echo 'Out of range.'; continue; }
+    db_cmd "${commands[$((pick-1))]}"; return
+  done
+}
+
+db_cmd() {
+  local action="${1:-menu}"; shift || true
+  case "$action" in
+    menu) db_menu;; ports) db_ports;; process) db_process "${1:-}";;
+    net) db_net "${1:-proxy}";; compare) db_net compare;; deps) db_deps;;
+    interfaces|ifaces) db_interfaces;; dns) db_dns;; routes|route) db_routes;;
+    api) db_api;; config) db_config;; log) db_log "${1:-80}";;
+    help|-h|--help) db_menu;;
+    *) die 'usage: sb db [ports|process|net|compare|deps|interfaces|dns|routes|api|config|log]' ;;
+  esac
+}
+
+doctor_cmd() {
+  echo '== sb doctor =='; status_cmd; echo; "$SB_BIN" version | sed -n '1,2p'; getcap "$SB_BIN" 2>/dev/null || true
+  echo; echo '== profiles =='; list_profiles || true; echo; echo '== config =='; check_cmd
+  echo; echo '== log =='; [[ -f "$SB_LOG" ]] && tail -n 30 "$SB_LOG" || echo 'no log'
+}
+
+help_cmd() {
+  local profile="$(current_profile 2>/dev/null || true)" count="$(list_profiles | wc -l)"
+  cat <<EOF
+sb - sing-box profile/provider CLI
+
+  add <name> <url|file>       Add a sing-box JSON provider
+  start [name]                Choose and start a provider profile
+  stop | end                  Stop managed sing-box
+  update                      Update current HTTP provider
+  -l, --list [keyword]        Speed-test, sort, show, choose nodes
+  mode rule|global|direct     Set route mode and restart
+  set cliproxy on|off         Terminal proxy state (shell hook)
+  set sysproxy on|off         GNOME system proxy
+  set proxy on|off            Both terminal and system proxy
+  set tun on|off              TUN and restart
+  set rules show|update|reset Manage root bypass.list
+  status | check [name]       Status / merged config check
+  shell-init                  Print Bash integration
+  env | noenv                 Print exports / unsets
+  db [action]                  Debug menu: ports/process/net/DNS/routes/API/config
+  log | doctor                Log / diagnostics
+  -h, --help                  Help plus concise configuration
+
+root: $SB_ROOT
+profiles: $count  current: ${profile:-<none>}
+mode: $(setting mode)  tun: $(setting tun)  cliproxy: $(setting cliproxy)  sysproxy: $(setting sysproxy)
+mixed: 127.0.0.1:$SB_PORT  api: 127.0.0.1:$SB_API_PORT
+EOF
+}
+
+init_layout
+case "${1:-status}" in
+  add) shift; add_cmd "$@";; start) shift; start_cmd "${1:-}";; stop|end) stop_cmd;; update) update_cmd;;
+  -l|--list|list) shift; list_nodes_cmd "${1:-}";; mode) shift; mode_cmd "${1:-}";; set) shift; set_cmd "$@";;
+  status) status_cmd;; check) shift; check_cmd "${1:-}";; env) show_env;; noenv) show_noenv;; shell-init) shell_init_cmd;;
+  db) shift; db_cmd "$@";;
+  log) touch "$SB_LOG"; tail -n 80 -f "$SB_LOG";; doctor) doctor_cmd;; -h|--help|help) help_cmd;;
+  *) help_cmd >&2; exit 2;;
+esac

@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+set -euo pipefail
+shopt -s nullglob
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
+MH_ROOT="${MIHOMO_ROOT:-$SCRIPT_DIR}"
+MH_BIN="${MIHOMO_BIN:-${MH_ROOT}/mihomo}"
+MH_SYSTEM="${MH_ROOT}/system/config.yaml"
+MH_BYPASS="${MH_ROOT}/bypass.list"
+MH_PROFILES="${MH_ROOT}/profiles"
+MH_CURRENT="${MH_ROOT}/current.profile"
+MH_SETTINGS="${MH_ROOT}/settings.json"
+MH_RUNTIME="${MIHOMO_RUN_DIR:-${MH_ROOT}/.runtime}"
+MH_CONFIG="${MH_RUNTIME}/config.yaml"
+MH_RULES="${MH_RUNTIME}/bypass-rules.json"
+MH_PID_FILE="${MH_RUNTIME}/run.pid"
+MH_LOG="${MH_RUNTIME}/mihomo.log"
+MH_MIXED_PORT="${MIHOMO_PORT:-7890}"
+MH_SOCKS_PORT="${MIHOMO_SOCKS_PORT:-7891}"
+MH_API_PORT="${MIHOMO_API_PORT:-9090}"
+MH_API="http://127.0.0.1:${MH_API_PORT}"
+
+die(){  printf 'mh: %s\n' "$*" >&2; exit 1; }
+info(){  printf 'mh: %s\n' "$*"; }
+warn(){  printf 'mh: warning: %s\n' "$*" >&2; }
+need(){  command -v "$1" >/dev/null 2>&1 || die "missing command: $1"; }
+
+init_layout(){ 
+  [[ -x "$MH_BIN" ]] || die "mihomo binary not executable: $MH_BIN"
+  [[ -f "$MH_SYSTEM" ]] || die "system config missing: $MH_SYSTEM"
+  [[ -f "$MH_BYPASS" ]] || die "bypass list missing: $MH_BYPASS"
+  need jq; need yq
+  mkdir -p "$MH_PROFILES" "$MH_RUNTIME"
+  [[ -f "$MH_SETTINGS" ]] || printf '%s\n' '{"mode":"rule","tun":false,"cliproxy":false,"sysproxy":false}' >"$MH_SETTINGS"
+}
+setting(){  jq -r --arg k "$1" '.[$k]' "$MH_SETTINGS"; }
+set_setting(){ 
+  local k="$1" v="$2"
+  if [[ "$v" == true || "$v" == false ]]; then jq --arg k "$k" --argjson v "$v" '.[$k]=$v' "$MH_SETTINGS" >"${MH_SETTINGS}.tmp"
+  else jq --arg k "$k" --arg v "$v" '.[$k]=$v' "$MH_SETTINGS" >"${MH_SETTINGS}.tmp"; fi
+  mv -f "${MH_SETTINGS}.tmp" "$MH_SETTINGS"
+}
+profile_dir(){  printf '%s/%s\n' "$MH_PROFILES" "$1"; }
+provider_file(){  printf '%s/provider.yaml\n' "$(profile_dir "$1")"; }
+metadata_file(){  printf '%s/source.json\n' "$(profile_dir "$1")"; }
+validate_name(){  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die 'profile name contains unsupported characters'; }
+current_profile(){ 
+  [[ -f "$MH_CURRENT" ]] || return 1
+  local n="$(tr -d '[:space:]' <"$MH_CURRENT")"
+  [[ -n "$n" && -f "$(provider_file "$n")" ]] || return 1
+  echo "$n"
+}
+list_profiles(){  local f; for f in "$MH_PROFILES"/*/provider.yaml; do [[ -f "$f" ]] && basename "$(dirname "$f")"; done | sort; }
+validate_provider(){  yq -e '.proxies | type == "array" and length > 0' "$1" >/dev/null || die "provider must be Clash YAML with non-empty proxies: $1"; }
+normalize_provider(){  validate_provider "$1"; yq -y '{proxies:.proxies}' "$1" >"$2"; validate_provider "$2"; }
+fetch_provider(){ 
+  local src="$1" dest="$2" raw
+  raw="${dest}.raw"
+  if [[ "$src" =~ ^https?:// ]]; then need curl; curl -fL --connect-timeout 15 --max-time 90 -A 'mihomo/1.19 mh-provider' "$src" -o "$raw"
+  elif [[ -f "$src" ]]; then cp -f -- "$src" "$raw"
+  else die "source is neither HTTP URL nor file: $src"; fi
+  normalize_provider "$raw" "$dest"; rm -f "$raw"
+}
+add_cmd(){ 
+  local name="${1:-}" src="${2:-}" dir tmp kind saved
+  [[ -n "$name" && -n "$src" ]] || die 'usage: mh add <name> <url|file>'
+  validate_name "$name"; dir="$(profile_dir "$name")"; [[ ! -e "$dir" ]] || die "profile exists: $name"
+  mkdir -p "$dir"; tmp="${dir}/provider.yaml.tmp"
+  if [[ "$src" =~ ^https?:// ]]; then kind=http; saved="$src"; else kind=file; saved="$(readlink -f "$src")"; fi
+  if ! fetch_provider "$src" "$tmp"; then rm -f "$tmp" "${tmp}.raw"; rmdir "$dir" 2>/dev/null || true; return 1; fi
+  mv -f "$tmp" "${dir}/provider.yaml"
+  jq -n --arg name "$name" --arg type "$kind" --arg source "$saved" --arg added_at "$(date -Iseconds)" '{name:$name,type:$type,source:$source,added_at:$added_at}' >"${dir}/source.json"
+  echo "$name" >"$MH_CURRENT"; info "added profile=${name} type=${kind}"; info "run: mh start ${name}"
+}
+
+compile_bypass(){ 
+  local line value prefix; : >"${MH_RULES}.lines"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"; line="$(sed -E 's/^[[:space:]]+|[[:space:]]+$//g' <<<"$line")"; [[ -n "$line" ]] || continue
+    if [[ "$line" == */* ]]; then [[ "$line" == *:* ]] && echo "IP-CIDR6,${line},DIRECT,no-resolve" || echo "IP-CIDR,${line},DIRECT,no-resolve"
+    elif [[ "$line" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "IP-CIDR,${line}/32,DIRECT,no-resolve"
+    elif [[ "$line" =~ ^(10|127|172|192)(\..*)?\*$ ]]; then prefix="${BASH_REMATCH[1]}"; case "$prefix" in 10)value=10.0.0.0/8;;127)value=127.0.0.0/8;;172)value=172.16.0.0/12;;192)value=192.168.0.0/16;;esac; echo "IP-CIDR,${value},DIRECT,no-resolve"
+    elif [[ "$line" == \** || "$line" == .* ]]; then value="${line#\*}"; value="${value#.}"; [[ -n "$value" ]] && echo "DOMAIN-SUFFIX,${value},DIRECT"
+    else echo "DOMAIN,${line},DIRECT"; fi
+  done <"$MH_BYPASS" | awk '!seen[$0]++' >"${MH_RULES}.lines"
+  jq -R -s 'split("\n")|map(select(length>0))' "${MH_RULES}.lines" >"$MH_RULES"; rm -f "${MH_RULES}.lines"
+}
+
+proxy_bypass_items(){
+  local mode="$1" line value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"; line="$(sed -E 's/^[[:space:]]+|[[:space:]]+$//g' <<<"$line")"; [[ -n "$line" ]] || continue
+    value="$line"
+    if [[ "$mode" == no_proxy && "$value" == \*.* ]]; then value=".${value#*.}"
+    elif [[ "$mode" == gsettings && "$value" == .* ]]; then value="*${value}"; fi
+    printf '%s\n' "$value"
+  done <"$MH_BYPASS" | awk '!seen[$0]++'
+}
+no_proxy_value(){ proxy_bypass_items no_proxy | paste -sd, -; }
+gsettings_bypass_value(){ proxy_bypass_items gsettings | jq -Rsc 'split("\n") | map(select(length > 0))'; }
+
+build_config(){ 
+  local profile="$1" provider sys rules mode tun
+  provider="$(provider_file "$profile")"; [[ -f "$provider" ]] || die "profile not found: $profile"; validate_provider "$provider"
+  compile_bypass; sys="$(yq -c . "$MH_SYSTEM")"; rules="$(<"$MH_RULES")"; mode="$(setting mode)"; tun="$(setting tun)"
+  jq -n --argjson s "$sys" --argjson rules "$rules" --arg profile "$profile" --arg provider "$provider" --arg mode "$mode" --argjson tun "$tun" \
+    --argjson mixed "$MH_MIXED_PORT" --argjson socks "$MH_SOCKS_PORT" --arg controller "127.0.0.1:${MH_API_PORT}" '
+    $s
+    | .["mixed-port"]=$mixed | .["socks-port"]=$socks | .["external-controller"]=$controller | .mode=$mode
+    | .["proxy-providers"]={($profile):{type:"file",path:$provider,health_check:{enable:true,url:"https://www.gstatic.com/generate_204",interval:600}}}
+    | .["proxy-groups"]=[{name:"Proxy",type:"select",use:[$profile]},{name:"Final",type:"select",proxies:["Proxy","DIRECT"]}]
+    | .rules=($rules+["MATCH,Final"])
+    | .tun={enable:$tun,stack:"system",device:"mihomo","auto-route":true,"auto-redir":true,"auto-detect-interface":true,"dns-hijack":["any:53"]}
+    | if $tun then .dns={enable:true,listen:"127.0.0.1:1053","enhanced-mode":"redir-host",nameserver:["223.5.5.5","119.29.29.29"],fallback:["1.1.1.1","8.8.8.8"],"fallback-filter":{geoip:false}} else del(.dns) end
+  ' | yq -y '.' >"${MH_CONFIG}.tmp"
+  mv -f "${MH_CONFIG}.tmp" "$MH_CONFIG"
+}
+
+process_alive(){  local pid="$1" state _; [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || return 1; read -r _ _ state _ <"/proc/${pid}/stat" 2>/dev/null || return 1; [[ "$state" != Z ]]; }
+is_running(){  [[ -f "$MH_PID_FILE" ]] && process_alive "$(<"$MH_PID_FILE")"; }
+port_in_use(){  ss -ltnH 2>/dev/null | awk -v s=":$1" 'substr($4,length($4)-length(s)+1)== s{f=1}END{exit !f}'; }
+api_curl(){  local secret="$(yq -r '.secret // ""' "$MH_CONFIG" 2>/dev/null || true)"; if [[ -n "$secret" ]]; then curl -fsS --noproxy '*' -H "Authorization: Bearer $secret" "$@"; else curl -fsS --noproxy '*' "$@"; fi; }
+wait_api(){  local i; for i in {1..50}; do api_curl "$MH_API/proxies" >/dev/null 2>&1 && return; sleep .1; done; return 1; }
+
+stop_cmd(){ 
+  if ! is_running; then rm -f "$MH_PID_FILE"; info 'not running'; return; fi
+  local pid="$(<"$MH_PID_FILE")" expected actual comm cmdline i
+  expected="$(readlink -f "$MH_BIN")"; actual="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"; comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"; cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+  if [[ "$actual" != "$expected" ]]; then [[ "$comm" == "$(basename "$MH_BIN")" && "$cmdline" == "$MH_BIN -d "* && "$cmdline" == *" -f $MH_CONFIG"* ]] || die "refusing to stop pid $pid: identity mismatch"; fi
+  kill "$pid" 2>/dev/null || true; for i in {1..30}; do process_alive "$pid" || break; sleep .1; done; process_alive "$pid" && die "pid $pid did not stop"
+  rm -f "$MH_PID_FILE"; info "stopped pid $pid"
+}
+
+choose_profile(){ 
+  local requested="${1:-}" current pick i; local -a profiles; mapfile -t profiles < <(list_profiles); ((${#profiles[@]})) || die 'no providers; use mh add'
+  current="$(current_profile 2>/dev/null || true)"
+  if [[ -n "$requested" ]]; then [[ -f "$(provider_file "$requested")" ]] || die "profile not found: $requested"; echo "$requested"; return; fi
+  if [[ ! -t 0 ]]; then [[ -n "$current" ]] || die 'non-interactive start needs name'; echo "$current"; return; fi
+  echo 'Available providers:' >&2; for i in "${!profiles[@]}"; do [[ "${profiles[$i]}" == "$current" ]] && printf '  %d) %s (current)\n' "$((i+1))" "${profiles[$i]}" >&2 || printf '  %d) %s\n' "$((i+1))" "${profiles[$i]}" >&2; done
+  while true; do read -r -p "Choose provider (1-${#profiles[@]}, 0 cancel): " pick; [[ "$pick" =~ ^[0-9]+$ ]] || continue; ((pick== 0)) && return 1; ((pick>=1&&pick<=${#profiles[@]})) && { echo "${profiles[$((pick-1))]}"; return; }; done
+}
+start_cmd(){ 
+  local profile pid i; profile="$(choose_profile "${1:-}")" || { info cancelled; return; }; build_config "$profile"
+  "$MH_BIN" -t -d "$MH_ROOT" -f "$MH_CONFIG" >/dev/null; is_running && stop_cmd; need ss
+  for i in "$MH_MIXED_PORT" "$MH_SOCKS_PORT" "$MH_API_PORT"; do port_in_use "$i" && die "port $i is in use"; done
+  : >"$MH_LOG"; nohup "$MH_BIN" -d "$MH_ROOT" -f "$MH_CONFIG" >>"$MH_LOG" 2>&1 & pid=$!; echo "$pid" >"$MH_PID_FILE"; echo "$profile" >"$MH_CURRENT"
+  for i in {1..50}; do ! process_alive "$pid" && { rm -f "$MH_PID_FILE"; tail -n 40 "$MH_LOG" >&2; die 'mihomo exited'; }; port_in_use "$MH_MIXED_PORT" && port_in_use "$MH_API_PORT" && { info "started profile=$profile pid=$pid mode=$(setting mode) tun=$(setting tun)"; wait_api || warn 'API not ready'; return; }; sleep .1; done
+  die 'startup timeout'
+}
+restart_if_running(){  local p="$(current_profile 2>/dev/null || true)"; if is_running; then stop_cmd; start_cmd "$p"; fi; }
+check_cmd(){  local p="${1:-}"; [[ -n "$p" ]] || p="$(current_profile 2>/dev/null || true)"; [[ -n "$p" ]] || die 'no profile'; build_config "$p"; "$MH_BIN" -t -d "$MH_ROOT" -f "$MH_CONFIG"; info "configuration OK: profile=$p"; }
+require_api(){  is_running || die 'mihomo is not running'; api_curl "$MH_API/proxies" >/dev/null || die "API unavailable: $MH_API"; }
+urlencode(){  jq -nr --arg v "$1" '$v|@uri'; }
+api_delay(){  local n="$1" e u; e="$(urlencode "$n")"; u="$(urlencode 'https://www.gstatic.com/generate_204')"; api_curl "$MH_API/proxies/$e/delay?timeout=1800&url=$u" 2>/dev/null | jq -r 'if (.delay|type)=="number" then .delay else 999999 end' 2>/dev/null || echo 999999; }
+delay_text(){ local d="${1:-}"; [[ "$d" =~ ^[0-9]+$ && "$d" != 999999 ]] && printf '%sms\n' "$d" || printf 'timeout\n'; }
+main_group(){  jq -r 'if .proxies.Proxy.all then "Proxy" else [.proxies|to_entries[]|select(.value.all!=null)][0].key//empty end' <<<"$1"; }
+display_grid(){  local -n r=$1; local n=${#r[@]} w c=1 rows i j k; w="$(tput cols 2>/dev/null||echo 120)"; ((n>18&&w>=110))&&c=2; ((n>36&&w>=170))&&c=3; rows=$(((n+c-1)/c)); for((i=0;i<rows;i++));do for((j=0;j<c;j++));do k=$((i+j*rows));((k<n))||continue; if((j+1<c&&k+rows<n));then printf '%-56s' "${r[$k]}";else printf '%s' "${r[$k]}";fi;done;echo;done; }
+list_nodes_cmd(){ 
+  local kw="${1:-}" json group now candidates tmp running=0 i d pick enc body; local -a nodes sorted=() delays=() view=()
+  require_api; json="$(api_curl "$MH_API/proxies")"; group="$(main_group "$json")"; [[ -n "$group" ]]||die 'no selectable group'; now="$(jq -r --arg g "$group" '.proxies[$g].now//empty'<<<"$json")"
+  candidates="$(jq -r --arg g "$group" --arg kw "$kw" 'def lc:ascii_downcase;. as $r|.proxies[$g].all[] as $n|($r.proxies[$n].type//"")as$t|select(["Direct","Reject","Selector","URLTest","Fallback","LoadBalance"]|index($t)== null)|select($kw==""or($n|contains($kw))or(($n|lc)|contains($kw|lc)))|$n'<<<"$json")"
+  [[ -n "$candidates" ]]||die "no nodes matched: ${kw:-<all>}"; mapfile -t nodes<<<"$candidates"; tmp="$(mktemp -d "$MH_RUNTIME/delay.XXXXXX")"; info "testing ${#nodes[@]} nodes (1800ms, 8 jobs)..."
+  for i in "${!nodes[@]}";do(api_delay "${nodes[$i]}">"$tmp/$i")& running=$((running+1));if((running>=8));then wait -n 2>/dev/null||wait;running=$((running-1));fi;done;wait;:>"$tmp/index"
+  for i in "${!nodes[@]}";do d="$(<"$tmp/$i")";[[ "$d" =~ ^[0-9]+$ ]]||d=999999;printf '%s\t%s\n' "$d" "$i">>"$tmp/index";done
+  while IFS=$'\t' read -r d i;do delays+=("$d");sorted+=("${nodes[$i]}");done< <(sort -n "$tmp/index");rm -rf -- "$tmp"
+  printf 'Group: %s  Current: %s' "$group" "$now";[[ -n "$kw" ]]&&printf '  Filter: %s' "$kw";echo
+  for i in "${!sorted[@]}";do d="$(delay_text "${delays[$i]}")";[[ "${sorted[$i]}" == "$now" ]]&&view+=("[$((i+1))] * ${sorted[$i]}  $d")||view+=("[$((i+1))]   ${sorted[$i]}  $d");done;display_grid view
+  [[ -t 0 ]]||return;while true;do read -r -p "Choose node (1-${#sorted[@]}, 0 cancel): " pick;[[ "$pick" =~ ^[0-9]+$ ]]||continue;((pick== 0))&&return;((pick>=1&&pick<=${#sorted[@]}))&&break;done
+  enc="$(urlencode "$group")";body="$(jq -nc --arg name "${sorted[$((pick-1))]}" '{name:$name}')";api_curl -X PUT -H 'Content-Type: application/json' --data "$body" "$MH_API/proxies/$enc">/dev/null;info "$group -> ${sorted[$((pick-1))]}"
+}
+
+show_env(){  local no_proxy; no_proxy="$(no_proxy_value)"; cat <<EOF
+export http_proxy="http://127.0.0.1:${MH_MIXED_PORT}"
+export https_proxy="http://127.0.0.1:${MH_MIXED_PORT}"
+export all_proxy="socks5h://127.0.0.1:${MH_SOCKS_PORT}"
+export HTTP_PROXY="\$http_proxy"
+export HTTPS_PROXY="\$https_proxy"
+export ALL_PROXY="\$all_proxy"
+EOF
+printf 'export NO_PROXY=%q\n' "$no_proxy"
+printf '%s\n' 'export no_proxy="$NO_PROXY"'
+}
+show_noenv(){  echo 'unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY no_proxy'; }
+shell_init_cmd(){  local real="$(printf %q "$SCRIPT_PATH")";cat <<EOF
+mh() {
+  MH_SHELL_HOOK=1 ${real} "\$@"
+  local rc=\$?
+  if ((rc== 0)) && [[ "\${1:-}" == set ]] && { [[ "\${2:-}" == cliproxy ]] || [[ "\${2:-}" == proxy ]]; }; then
+    if [[ "\${3:-}" == on ]]; then eval "\$(${real} env)"; else eval "\$(${real} noenv)"; fi
+  fi
+  return \$rc
+}
+EOF
+[[ "$(setting cliproxy)" == true ]]&&show_env||show_noenv; }
+sysproxy_cmd(){  local a="$1" ignore_hosts;need gsettings;case "$a" in on)ignore_hosts="$(gsettings_bypass_value)";gsettings set org.gnome.system.proxy mode manual;for s in http https;do gsettings set org.gnome.system.proxy.$s host 127.0.0.1;gsettings set org.gnome.system.proxy.$s port "$MH_MIXED_PORT";done;gsettings set org.gnome.system.proxy.socks host 127.0.0.1;gsettings set org.gnome.system.proxy.socks port "$MH_SOCKS_PORT";gsettings set org.gnome.system.proxy ignore-hosts "$ignore_hosts";set_setting sysproxy true;info 'system proxy ON';;off)gsettings set org.gnome.system.proxy mode none;set_setting sysproxy false;info 'system proxy OFF';;status)echo "setting=$(setting sysproxy) mode=$(gsettings get org.gnome.system.proxy mode)";;*)die 'usage: mh set sysproxy on|off';;esac; }
+default_bypass(){  cat <<'EOF'
+# mh system bypass rules
+localhost
+*.local
+127.0.0.0/8
+10.0.0.0/8
+172.16.0.0/12
+192.168.0.0/16
+100.64.0.2
+100.64.0.0/10
+::1/128
+fc00::/7
+fe80::/10
+EOF
+}
+rules_cmd(){ case "${1:-show}" in show)echo "bypass.list: $MH_BYPASS";nl -ba "$MH_BYPASS";;update)compile_bypass;[[ "$(setting sysproxy)" == true ]]&&sysproxy_cmd on;info "compiled $(jq length "$MH_RULES") bypass rules";restart_if_running;;reset)default_bypass>"$MH_BYPASS.tmp";mv -f "$MH_BYPASS.tmp" "$MH_BYPASS";compile_bypass;[[ "$(setting sysproxy)" == true ]]&&sysproxy_cmd on;info 'bypass reset';restart_if_running;;*)die 'usage: mh set rules show|update|reset';;esac;}
+set_cmd(){  local t="${1:-}" a="${2:-}";[[ -n "$t" ]]|| { jq . "$MH_SETTINGS";sysproxy_cmd status 2>/dev/null||true;return;};case "$t" in cliproxy)[[ "$a" == on||"$a" == off ]]||die 'usage: mh set cliproxy on|off';set_setting cliproxy "$([[ "$a" == on ]]&&echo true||echo false)";info "CLI proxy $a";[[ -n "${MH_SHELL_HOOK:-}" ]]||warn 'run once: eval "$(mh shell-init)"';;sysproxy)sysproxy_cmd "$a";;proxy)[[ "$a" == on||"$a" == off ]]||die 'usage: mh set proxy on|off';set_setting cliproxy "$([[ "$a" == on ]]&&echo true||echo false)";sysproxy_cmd "$a";info "CLI + system proxy $a";;tun)[[ "$a" == on||"$a" == off ]]||die 'usage: mh set tun on|off';set_setting tun "$([[ "$a" == on ]]&&echo true||echo false)";[[ "$a" == on ]]&&! getcap "$MH_BIN" 2>/dev/null|grep -q cap_net_admin&&warn "TUN may need setcap on $MH_BIN";info "TUN $a";restart_if_running;;rules)rules_cmd "$a";;*)die 'usage: mh set cliproxy|sysproxy|proxy|tun|rules';;esac; }
+update_cmd(){ local p meta type src tmp running=false;p="$(current_profile 2>/dev/null||true)";[[ -n "$p" ]]||die 'no current profile';meta="$(metadata_file "$p")";type="$(jq -r .type "$meta")";src="$(jq -r .source "$meta")";[[ "$type" == http ]]||die 'current provider is local file';is_running&&running=true;tmp="$(provider_file "$p").tmp";fetch_provider "$src" "$tmp";mv -f "$tmp" "$(provider_file "$p")";jq --arg t "$(date -Iseconds)" '.updated_at=$t' "$meta">"$meta.tmp";mv -f "$meta.tmp" "$meta";info "updated HTTP provider: $p";[[ "$running" == true ]]&& { stop_cmd;start_cmd "$p";};}
+mode_cmd(){ local m="${1:-}";[[ "$m" == rule||"$m" == global||"$m" == direct ]]||die 'usage: mh mode rule|global|direct';set_setting mode "$m";info "mode -> $m";restart_if_running;}
+
+status_cmd(){
+  local p="$(current_profile 2>/dev/null||true)" now='' delay=''
+  if is_running;then
+    now="$(api_curl "$MH_API/proxies/Proxy" 2>/dev/null|jq -r '.now//empty'||true)"
+    [[ -n "$now" ]]&&delay="$(delay_text "$(api_delay "$now")")"
+    echo "mihomo: RUNNING pid=$(<"$MH_PID_FILE")"
+  else
+    echo 'mihomo: STOPPED'
+  fi
+  printf 'root:     %s\nprofile:  %s\nmode:     %s\ntun:      %s\ncliproxy: %s\nsysproxy: %s\nmixed:    127.0.0.1:%s\nsocks:    127.0.0.1:%s\napi:      127.0.0.1:%s\n' "$MH_ROOT" "${p:-<none>}" "$(setting mode)" "$(setting tun)" "$(setting cliproxy)" "$(setting sysproxy)" "$MH_MIXED_PORT" "$MH_SOCKS_PORT" "$MH_API_PORT"
+  [[ -n "$now" ]]&&printf 'node:     %s  %s\n' "$now" "$delay"
+}
+
+db_ports(){ echo '== proxy ports ==';ss -ltnp 2>/dev/null|awk -v a=":$MH_MIXED_PORT" -v b=":$MH_SOCKS_PORT" -v c=":$MH_API_PORT" 'NR== 1||index($4,a)||index($4,b)||index($4,c)';}
+db_process(){ local p="${1:-}";[[ -n "$p" ]]|| { [[ -f "$MH_PID_FILE" ]]&&p="$(<"$MH_PID_FILE")"||true;};[[ "$p" =~ ^[0-9]+$ ]]||die 'no managed PID';ps -p "$p" -o pid,ppid,user,state,etime,%cpu,%mem,cmd;}
+db_probe(){ local mode="$1" url="$2";if [[ "$mode" == direct ]];then curl -fsSIL --max-time 10 --noproxy '*' "$url" -o /dev/null;else curl -fsSIL --max-time 10 --proxy "http://127.0.0.1:$MH_MIXED_PORT" "$url" -o /dev/null;fi;}
+db_net(){ local mode="${1:-proxy}" u x y;local -a urls=('https://www.google.com' 'https://www.cloudflare.com' 'https://www.github.com' 'https://www.youtube.com' 'https://www.baidu.com' 'https://www.bing.com');[[ "$mode" == direct ]]||require_api;for u in "${urls[@]}";do if [[ "$mode" == compare ]];then db_probe direct "$u"&&x=OK||x=FAIL;db_probe proxy "$u"&&y=OK||y=FAIL;printf '%-32s DIRECT:%-4s PROXY:%-4s\n' "$u" "$x" "$y";else db_probe "$mode" "$u"&&x=OK||x=FAIL;printf '%-32s %s:%s\n' "$u" "${mode^^}" "$x";fi;done;}
+db_deps(){ local x p rc=0;for x in jq yq curl ss sed sort readlink;do p="$(command -v "$x" 2>/dev/null||true)";[[ -n "$p" ]]&&printf 'OK      %-10s %s\n' "$x" "$p"|| { echo "MISSING $x";rc=1;};done;[[ -x "$MH_BIN" ]]&&echo "OK      mihomo $MH_BIN"||rc=1;return "$rc";}
+db_interfaces(){ ip -brief link show 2>/dev/null||true;echo "TUN setting=$(setting tun)";}
+db_dns(){ echo '== generated DNS ==';yq .dns "$MH_CONFIG" 2>/dev/null||echo disabled;echo '== host resolver ==';resolvectl status 2>/dev/null|sed -n '1,140p'||cat /etc/resolv.conf;}
+db_routes(){ ip route show;echo;ip rule show;}
+db_api(){ require_api;api_curl "$MH_API/version"|jq .;api_curl "$MH_API/proxies"|jq -r '.proxies|to_entries[]|select(.value.all!=null)|"\(.key) -> \(.value.now//"-") (\(.value.all|length))"';}
+db_config(){ check_cmd; yq -c '{mode,ports:{mixed:."mixed-port",socks:."socks-port",api:."external-controller"},tun:.tun,providers:(."proxy-providers"|keys),groups:(."proxy-groups"|map(.name)),rule_count:(.rules|length)}' "$MH_CONFIG"|jq .;}
+db_log(){ local n="${1:-80}";[[ "$n" =~ ^[0-9]+$ ]]||die 'lines must be number';tail -n "$n" "$MH_LOG" 2>/dev/null||echo 'no log';}
+db_menu(){ local pick i;local -a c=(ports process net compare deps interfaces dns routes api config log);echo '== mh db ==';for i in "${!c[@]}";do printf ' %2d) %s\n' "$((i+1))" "${c[$i]}";done;[[ -t 0 ]]||return;read -r -p 'Choose: ' pick;[[ "$pick" =~ ^[0-9]+$ ]]&&((pick>=1&&pick<=${#c[@]}))&&db_cmd "${c[$((pick-1))]}";}
+db_cmd(){ local a="${1:-menu}";shift||true;case "$a" in menu)db_menu;;ports)db_ports;;process)db_process "${1:-}";;net)db_net "${1:-proxy}";;compare)db_net compare;;deps)db_deps;;interfaces)db_interfaces;;dns)db_dns;;routes)db_routes;;api)db_api;;config)db_config;;log)db_log "${1:-80}";;*)die 'usage: mh db [ports|process|net|compare|deps|interfaces|dns|routes|api|config|log]';;esac;}
+doctor_cmd(){ echo '== mh doctor ==';status_cmd;echo;db_deps;echo;db_ports;echo;db_config;echo;db_log 30;}
+help_cmd(){ local p="$(current_profile 2>/dev/null||true)" count="$(list_profiles|wc -l)";cat <<EOF
+mh - mihomo profile/provider CLI
+  add <name> <url|file>       Add Clash YAML provider
+  start [name]                Choose/start provider profile
+  stop | end                  Stop managed mihomo
+  update                      Update current HTTP provider
+  -l, --list [keyword]        Speed-test/sort/choose nodes
+  mode rule|global|direct     Set mode and restart
+  set cliproxy on|off         Terminal env (shell hook)
+  set sysproxy on|off         GNOME system proxy
+  set proxy on|off            Both terminal/system proxy
+  set tun on|off              TUN and restart
+  set rules show|update|reset Manage root bypass.list
+  status | check [name]       Status/config check
+  shell-init | env | noenv    Shell integration
+  db [action]                 Debug menu/actions
+  log | doctor                Logs/diagnostics
+root: $MH_ROOT
+profiles: $count current: ${p:-<none>}
+mode: $(setting mode) tun: $(setting tun) cliproxy: $(setting cliproxy) sysproxy: $(setting sysproxy)
+ports: mixed=$MH_MIXED_PORT socks=$MH_SOCKS_PORT api=$MH_API_PORT
+EOF
+}
+
+init_layout
+case "${1:-status}" in add)shift;add_cmd "$@";;start)shift;start_cmd "${1:-}";;stop|end)stop_cmd;;update)update_cmd;;-l|--list|list)shift;list_nodes_cmd "${1:-}";;mode)shift;mode_cmd "${1:-}";;set)shift;set_cmd "$@";;status)status_cmd;;check)shift;check_cmd "${1:-}";;env)show_env;;noenv)show_noenv;;shell-init)shell_init_cmd;;db)shift;db_cmd "$@";;log)touch "$MH_LOG";tail -n 80 -f "$MH_LOG";;doctor)doctor_cmd;;-h|--help|help)help_cmd;;*)help_cmd>&2;exit 2;;esac

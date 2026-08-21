@@ -1,0 +1,30 @@
+schema_version = 1
+
+[core]
+name = "sing-box"
+family = "sing-box"
+version = "1.13.14"
+binary = "sing-box"
+os = "linux"
+arch = "x86_64"
+
+[runtime]
+entrypoint = "config.json"
+format = "json"
+
+[capabilities.config]
+mixed_proxy = true
+http_proxy = false
+socks_proxy = false
+api = true
+dns = true
+tun = true
+
+[commands.start]
+args = ["run", "-D", "{workdir}", "-c", "{config}"]
+
+[commands.check]
+args = ["check", "-D", "{workdir}", "-c", "{config}"]
+
+[commands.version]
+args = ["version"]

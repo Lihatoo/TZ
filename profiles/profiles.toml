@@ -1,0 +1,52 @@
+schema_version = 1
+
+[current]
+clash = "tnt_luo-clash"
+sing-box = "nano-sb"
+
+[[profiles]]
+name = "tnt_luo-clash"
+family = "clash"
+format = "yaml"
+source_file = "tnt_luo-clash/source.yaml"
+
+[profiles.origin]
+kind = "remote"
+url = "https://linkuserssnk.xxyjx.cc/s/jBdoEVwWpmI3-a9d96b27?clash=1"
+download_via = "proxy"
+
+[profiles.update]
+
+[profiles.state.selected]
+Proxy = "[Lv3·2.0x] 美国LA05"
+
+[[profiles]]
+name = "nano-clash"
+family = "clash"
+format = "yaml"
+source_file = "nano-clash/source.yaml"
+
+[profiles.origin]
+kind = "remote"
+url = "https://47.76.155.27/iv/verify_mode.htm?token=f52f7188d4ed4201e21463d136733689&sid=nano"
+download_via = "proxy"
+
+[profiles.update]
+
+[profiles.state]
+
+[[profiles]]
+name = "nano-sb"
+family = "sing-box"
+format = "json"
+source_file = "nano-sb/source.json"
+
+[profiles.origin]
+kind = "remote"
+url = "https://47.76.155.27/iv/verify_mode.htm?token=f52f7188d4ed4201e21463d136733689&sid=nano"
+download_via = "proxy"
+
+[profiles.update]
+
+[profiles.state.selected]
+Proxy = "🇺🇸美国-C(通用)"

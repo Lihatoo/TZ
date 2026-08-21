@@ -1,0 +1,30 @@
+schema_version = 1
+
+[core]
+name = "mihomo"
+family = "clash"
+version = "REPLACE_WITH_REAL_VERSION"
+binary = "mihomo"
+os = "linux"
+arch = "x86_64"
+
+[runtime]
+entrypoint = "config.yaml"
+format = "yaml"
+
+[capabilities.config]
+mixed_proxy = true
+http_proxy = true
+socks_proxy = true
+api = true
+dns = true
+tun = true
+
+[commands.start]
+args = ["-d", "{workdir}", "-f", "{config}"]
+
+[commands.check]
+args = ["-t", "-d", "{workdir}", "-f", "{config}"]
+
+[commands.version]
+args = ["-v"]
