@@ -47,7 +47,7 @@ tz core use mihomo
 | --- | --- | --- |
 | `mihomo` | `clash` | YAML |
 | `sing-box` | `sing-box` | JSON |
-
+cores均来自官方的mihomo 较新、sing-box 13 内核，更新可以尝试直接下载内核替换即可
 添加并选择 profile：
 
 ```bash
